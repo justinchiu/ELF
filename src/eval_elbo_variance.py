@@ -25,10 +25,6 @@ import time
 from pathlib import Path
 
 import jax
-try:
-    jax.distributed.initialize()
-except (RuntimeError, ValueError):
-    pass
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -75,7 +71,22 @@ def hutchinson_div_single(velocity_fn, z, t, eps):
     return jnp.sum(eps * jvp_eps, axis=reduce_axes)
 
 
-def make_velocity_fn(model_apply_fn, params, t_eps, num_self_cond_cfg_tokens):
+def maybe_initialize_distributed(enabled):
+    """Initialize multi-host JAX only for full-pod runs.
+
+    Calling jax.distributed.initialize() on worker 0 by itself can block while it
+    waits for the rest of the TPU pod. Single-host smoke tests and --toy_check
+    should leave JAX in local-process mode.
+    """
+    if not enabled:
+        return
+    try:
+        jax.distributed.initialize()
+    except (RuntimeError, ValueError):
+        pass
+
+
+def make_velocity_fn(model_apply_fn, params, t_eps, use_self_cond_input, num_self_cond_cfg_tokens):
     """Build a pure (z, t) -> v function with self-cond input zeroed, CFG=1.
 
     Notes:
@@ -87,7 +98,7 @@ def make_velocity_fn(model_apply_fn, params, t_eps, num_self_cond_cfg_tokens):
       - We never pass decoder_step_active, so the decoder branch is gated off.
     """
     def velocity_fn(z, t):
-        z_input = jnp.concatenate([z, jnp.zeros_like(z)], axis=-1)
+        z_input = jnp.concatenate([z, jnp.zeros_like(z)], axis=-1) if use_self_cond_input else z
         kwargs = {"deterministic": True}
         if num_self_cond_cfg_tokens > 0:
             kwargs["self_cond_cfg_scale"] = jnp.ones_like(t)
@@ -99,13 +110,16 @@ def make_velocity_fn(model_apply_fn, params, t_eps, num_self_cond_cfg_tokens):
     return velocity_fn
 
 
-def integrate_backward(velocity_fn, z1, n_steps, n_probes, probe_dist, rng):
+def integrate_backward(velocity_fn, z1, n_steps, n_probes, probe_dist, rng, valid_mask=None):
     """Backward Euler from t=1 to t=0; accumulate ∫ div(v) dt via Hutchinson.
 
     Returns (z0, integral_div) where integral_div ≈ ∫_0^1 div(v(z_t, t)) dt.
     """
     grid = jnp.linspace(1.0, 0.0, n_steps + 1)
     B = z1.shape[0]
+    active_mask = None if valid_mask is None else valid_mask[..., None].astype(z1.dtype)
+    if active_mask is not None:
+        z1 = z1 * active_mask
 
     def step_body(carry, i):
         z, integral = carry
@@ -116,12 +130,16 @@ def integrate_backward(velocity_fn, z1, n_steps, n_probes, probe_dist, rng):
 
         probe_rng = jax.random.fold_in(rng, i)
         eps = sample_probes(probe_rng, (n_probes,) + z.shape, probe_dist)
+        if active_mask is not None:
+            eps = eps * active_mask
         div_per_probe = jax.vmap(
             lambda e: hutchinson_div_single(velocity_fn, z, t_batch, e)
         )(eps)
         div_est = jnp.mean(div_per_probe, axis=0)
 
         v = velocity_fn(z, t_batch)
+        if active_mask is not None:
+            v = v * active_mask
         z_next = z - v * dt
         integral_next = integral + div_est * dt
         return (z_next, integral_next), None
@@ -154,7 +172,7 @@ def log_p_prior(z0, scale, valid_mask=None):
 def log_likelihood(velocity_fn, x1, n_steps, n_probes, probe_dist, rng,
                    prior_scale, valid_mask):
     z0, integral = integrate_backward(
-        velocity_fn, x1, n_steps, n_probes, probe_dist, rng,
+        velocity_fn, x1, n_steps, n_probes, probe_dist, rng, valid_mask=valid_mask,
     )
     log_p0, n_valid = log_p_prior(z0, prior_scale, valid_mask)
     return log_p0 - integral, n_valid, z0
@@ -236,12 +254,15 @@ def parse_args():
     p.add_argument("--toy_check", action="store_true",
                    help="Run toy-flow Hutchinson validation only and exit.")
     p.add_argument("--data_split", type=str, default="train")
+    p.add_argument("--distributed", action="store_true",
+                   help="Initialize JAX distributed. Use only for worker=all full-pod runs.")
     p.add_argument("--use_cpu", action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    maybe_initialize_distributed(args.distributed)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     if args.toy_check:
@@ -309,7 +330,9 @@ def main():
     eval_params = state.ema_params1
 
     velocity_fn = make_velocity_fn(
-        model.apply, eval_params, config.t_eps, config.num_self_cond_cfg_tokens,
+        model.apply, eval_params, config.t_eps,
+        use_self_cond_input=config.self_cond_prob > 0,
+        num_self_cond_cfg_tokens=config.num_self_cond_cfg_tokens,
     )
 
     log_for_0(f"Pulling {args.num_examples} OWT examples (max_length={config.max_length}, split={args.data_split})...")

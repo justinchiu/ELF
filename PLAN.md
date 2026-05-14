@@ -246,6 +246,7 @@ gcloud compute tpus tpu-vm ssh elf-elbo-v5p64-spot \
   --command="cd ~/ELF/src && python eval_elbo_variance.py \
     --config configs/training_configs/train_owt_ELF-B.yml \
     --checkpoint_path embedded-language-flows/ELF-B-owt \
+    --distributed \
     --steps 32,64,128,256 \
     --probes 1,2,4,8,16,32 \
     --repeats 16 \
@@ -261,6 +262,7 @@ gcloud compute tpus tpu-vm ssh elf-elbo-v5p64-spot \
   --command="cd ~/ELF/src && tmux new -d -s elbo_var 'python eval_elbo_variance.py \
     --config configs/training_configs/train_owt_ELF-B.yml \
     --checkpoint_path embedded-language-flows/ELF-B-owt \
+    --distributed \
     --steps 32,64,128,256 \
     --probes 1,2,4,8,16,32 \
     --repeats 16 \
