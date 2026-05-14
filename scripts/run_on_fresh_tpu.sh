@@ -180,9 +180,9 @@ else
   git pull --ff-only origin "$GIT_BRANCH"
 fi
 cd ~/ELF
-uv venv .venv --python 3.10
+uv venv .venv --python 3.10 --clear
 . .venv/bin/activate
-uv pip install -r requirements.txt
+uv pip install --prerelease=allow -r requirements.txt
 EOF
 )
 
