@@ -13,7 +13,7 @@
 #   scripts/run_on_fresh_tpu.sh "<remote-command>"    # explicit command
 #
 # Examples:
-#   scripts/run_on_fresh_tpu.sh "python eval_elbo_variance.py --toy_check"
+#   scripts/run_on_fresh_tpu.sh "JAX_PLATFORMS=cpu python eval_elbo_variance.py --toy_check"
 #
 #   RUN_WORKERS=0 BOOTSTRAP_WORKERS=0 scripts/run_on_fresh_tpu.sh \
 #     "python eval_elbo_variance.py --toy_check"
@@ -46,7 +46,7 @@ WORKER_BATCH_SIZE="${WORKER_BATCH_SIZE:-8}"
 FORCE_DELETE_EXISTING="${FORCE_DELETE_EXISTING:-0}"
 SKIP_BOOTSTRAP="${SKIP_BOOTSTRAP:-0}"
 
-EXPERIMENT_CMD="${1:-python eval_elbo_variance.py --toy_check}"
+EXPERIMENT_CMD="${1:-JAX_PLATFORMS=cpu python eval_elbo_variance.py --toy_check}"
 
 log() { printf '[run_on_fresh_tpu] %s\n' "$*" >&2; }
 
