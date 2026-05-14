@@ -133,6 +133,14 @@ case "$state" in
     delete_tpu
     create_tpu
     ;;
+  DELETING)
+    log "Existing $TPU_NAME is already DELETING; waiting for deletion to finish before recreating."
+    while [[ -n "$(current_state)" ]]; do
+      log "Waiting for $TPU_NAME to disappear (current: $(current_state))..."
+      sleep 10
+    done
+    create_tpu
+    ;;
   READY)
     if [[ "$FORCE_DELETE_EXISTING" == "1" ]]; then
       log "Existing $TPU_NAME is READY; FORCE_DELETE_EXISTING=1 so recreating."
