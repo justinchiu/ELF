@@ -14,6 +14,8 @@ Branch: `elbo-uv`
   - Optional high-budget reference estimates via `--reference_steps`,
     `--reference_probes`, and `--reference_repeats`.
   - Per-setting `bias^2`, repeat variance, MSE, and RMSE against the reference.
+  - `--parallel_repeats` mode shards estimator repeats across all TPU chips with
+    `pmap` and gathers repeat results across hosts.
 - Added and hardened `scripts/run_on_fresh_tpu.sh`:
   - Recreates `PREEMPTED` v5p-64 spot pods.
   - Reuses `READY` pods by default.
@@ -128,7 +130,8 @@ scripts/run_on_fresh_tpu.sh "python eval_elbo_variance.py \
   --repeats 16 \
   --reference_steps 512 \
   --reference_probes 256 \
-  --reference_repeats 4"
+  --reference_repeats 32 \
+  --parallel_repeats"
 ```
 
 5. If the smoke test succeeds, choose a clear evaluation set:

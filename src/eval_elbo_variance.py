@@ -22,6 +22,7 @@ import logging
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import jax
@@ -33,6 +34,8 @@ if REPO_ROOT not in sys.path:
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax import jax_utils
+from jax.experimental import multihost_utils
 from transformers import AutoTokenizer
 
 from configs.config import load_config_from_yaml
@@ -253,6 +256,8 @@ def parse_args():
                    help="High-budget probe count for reference estimate; 0 disables reference/MSE.")
     p.add_argument("--reference_repeats", type=int, default=1,
                    help="Number of high-budget reference repeats to average.")
+    p.add_argument("--parallel_repeats", action="store_true",
+                   help="Shard estimator repeats over all local/global devices with pmap.")
     p.add_argument("--probe_dist", type=str, default="rademacher",
                    choices=["rademacher", "gaussian"])
     p.add_argument("--seed", type=int, default=42)
@@ -306,6 +311,122 @@ def run_likelihood_repeats(
         "n_valid": n_valid,
         "nats_per_token": nats_per_token,
         "z0_norms": np.asarray(z0_norms),
+        "runtime_s": runtime_s,
+    }
+
+
+def _device_log_likelihood(
+    model_params,
+    x0,
+    attention_mask,
+    rng,
+    model_apply_fn,
+    config,
+    n_steps,
+    n_probes,
+    probe_dist,
+    prior_scale,
+):
+    velocity_fn = make_velocity_fn(
+        model_apply_fn,
+        model_params,
+        config.t_eps,
+        use_self_cond_input=config.self_cond_prob > 0,
+        num_self_cond_cfg_tokens=config.num_self_cond_cfg_tokens,
+    )
+    log_p, n_valid, z0 = log_likelihood(
+        velocity_fn,
+        x0,
+        n_steps,
+        n_probes,
+        probe_dist,
+        rng,
+        prior_scale,
+        attention_mask,
+    )
+    nats_per_token = -log_p / jnp.maximum(n_valid, 1.0)
+    z0_rms = jnp.sqrt(jnp.mean(z0 ** 2))
+    return log_p, n_valid, nats_per_token, z0_rms
+
+
+def all_hosts_concat(local_array):
+    local_array = jax.device_get(local_array)
+    if jax.process_count() == 1:
+        return np.asarray(local_array)
+    return np.asarray(multihost_utils.process_allgather(local_array, tiled=True))
+
+
+def run_likelihood_repeats_parallel(
+    model_apply_fn,
+    model_params_replicated,
+    x0_replicated,
+    attention_mask_replicated,
+    config,
+    n_steps,
+    n_probes,
+    probe_dist,
+    rng,
+    prior_scale,
+    n_repeats,
+    seed_offset,
+):
+    tic = time.time()
+    num_local_devices = jax.local_device_count()
+    num_global_devices = jax.device_count()
+    process_offset = jax.process_index() * num_local_devices
+
+    p_device_log_likelihood = jax.pmap(
+        partial(
+            _device_log_likelihood,
+            model_apply_fn=model_apply_fn,
+            config=config,
+            n_steps=n_steps,
+            n_probes=n_probes,
+            probe_dist=probe_dist,
+            prior_scale=prior_scale,
+        )
+    )
+
+    ll_chunks, n_valid_chunks, nats_chunks, z0_rms_chunks = [], [], [], []
+    repeats_done = 0
+    for round_start in range(0, n_repeats, num_global_devices):
+        round_rng = jax.random.fold_in(
+            rng, seed_offset + round_start * 1_000_003 + n_steps * 1_009 + n_probes
+        )
+        local_rngs = jnp.stack([
+            jax.random.fold_in(round_rng, process_offset + i)
+            for i in range(num_local_devices)
+        ])
+        log_p, n_valid, nats_per_token, z0_rms = p_device_log_likelihood(
+            model_params_replicated,
+            x0_replicated,
+            attention_mask_replicated,
+            local_rngs,
+        )
+        nats_per_token.block_until_ready()
+
+        all_ll = all_hosts_concat(log_p)
+        all_n_valid = all_hosts_concat(n_valid)
+        all_nats = all_hosts_concat(nats_per_token)
+        all_z0_rms = all_hosts_concat(z0_rms)
+
+        keep = min(num_global_devices, n_repeats - repeats_done)
+        ll_chunks.append(all_ll[:keep])
+        n_valid_chunks.append(all_n_valid[:keep])
+        nats_chunks.append(all_nats[:keep])
+        z0_rms_chunks.append(all_z0_rms[:keep])
+        repeats_done += keep
+
+    ll = np.concatenate(ll_chunks, axis=0)
+    n_valid = np.concatenate(n_valid_chunks, axis=0)
+    nats_per_token = np.concatenate(nats_chunks, axis=0)
+    z0_norms = np.concatenate([np.ravel(x) for x in z0_rms_chunks], axis=0)
+    runtime_s = time.time() - tic
+    return {
+        "ll": ll,
+        "n_valid": n_valid,
+        "nats_per_token": nats_per_token,
+        "z0_norms": z0_norms,
         "runtime_s": runtime_s,
     }
 
@@ -422,6 +543,9 @@ def main():
         use_self_cond_input=config.self_cond_prob > 0,
         num_self_cond_cfg_tokens=config.num_self_cond_cfg_tokens,
     )
+    eval_params_replicated = None
+    x0_replicated = None
+    attention_mask_replicated = None
 
     log_for_0(f"Pulling {args.num_examples} OWT examples (max_length={config.max_length}, split={args.data_split})...")
     input_ids, attention_mask = load_owt_examples(
@@ -437,6 +561,14 @@ def main():
     )
     n_tokens = int(attention_mask.sum())
     log_for_0(f"  x0 shape: {x0.shape}, valid tokens: {n_tokens}")
+    if args.parallel_repeats:
+        eval_params_replicated = jax_utils.replicate(eval_params)
+        x0_replicated = jax_utils.replicate(x0)
+        attention_mask_replicated = jax_utils.replicate(attention_mask)
+        log_for_0(
+            f"Parallel repeats enabled: each pmap round runs "
+            f"{jax.device_count()} global repeat(s) across {jax.process_count()} host(s)"
+        )
 
     steps_list = parse_int_list(args.steps)
     probes_list = parse_int_list(args.probes)
@@ -456,18 +588,34 @@ def main():
             f"Reference: steps={args.reference_steps} probes={args.reference_probes} "
             f"repeats={args.reference_repeats}"
         )
-        reference = run_likelihood_repeats(
-            velocity_fn=velocity_fn,
-            x0=x0,
-            attention_mask=attention_mask,
-            n_steps=args.reference_steps,
-            n_probes=args.reference_probes,
-            probe_dist=args.probe_dist,
-            rng=rng,
-            prior_scale=prior_scale,
-            n_repeats=args.reference_repeats,
-            seed_offset=100_000_000,
-        )
+        if args.parallel_repeats:
+            reference = run_likelihood_repeats_parallel(
+                model_apply_fn=model.apply,
+                model_params_replicated=eval_params_replicated,
+                x0_replicated=x0_replicated,
+                attention_mask_replicated=attention_mask_replicated,
+                config=config,
+                n_steps=args.reference_steps,
+                n_probes=args.reference_probes,
+                probe_dist=args.probe_dist,
+                rng=rng,
+                prior_scale=prior_scale,
+                n_repeats=args.reference_repeats,
+                seed_offset=100_000_000,
+            )
+        else:
+            reference = run_likelihood_repeats(
+                velocity_fn=velocity_fn,
+                x0=x0,
+                attention_mask=attention_mask,
+                n_steps=args.reference_steps,
+                n_probes=args.reference_probes,
+                probe_dist=args.probe_dist,
+                rng=rng,
+                prior_scale=prior_scale,
+                n_repeats=args.reference_repeats,
+                seed_offset=100_000_000,
+            )
         reference_nats_per_token = reference["nats_per_token"].mean(axis=0)
         ref_row = summarize_estimates(reference)
         log_for_0(
@@ -482,18 +630,34 @@ def main():
     for n_steps in steps_list:
         for n_probes in probes_list:
             key = f"steps{n_steps}_probes{n_probes}"
-            estimates = run_likelihood_repeats(
-                velocity_fn=velocity_fn,
-                x0=x0,
-                attention_mask=attention_mask,
-                n_steps=n_steps,
-                n_probes=n_probes,
-                probe_dist=args.probe_dist,
-                rng=rng,
-                prior_scale=prior_scale,
-                n_repeats=args.repeats,
-                seed_offset=0,
-            )
+            if args.parallel_repeats:
+                estimates = run_likelihood_repeats_parallel(
+                    model_apply_fn=model.apply,
+                    model_params_replicated=eval_params_replicated,
+                    x0_replicated=x0_replicated,
+                    attention_mask_replicated=attention_mask_replicated,
+                    config=config,
+                    n_steps=n_steps,
+                    n_probes=n_probes,
+                    probe_dist=args.probe_dist,
+                    rng=rng,
+                    prior_scale=prior_scale,
+                    n_repeats=args.repeats,
+                    seed_offset=0,
+                )
+            else:
+                estimates = run_likelihood_repeats(
+                    velocity_fn=velocity_fn,
+                    x0=x0,
+                    attention_mask=attention_mask,
+                    n_steps=n_steps,
+                    n_probes=n_probes,
+                    probe_dist=args.probe_dist,
+                    rng=rng,
+                    prior_scale=prior_scale,
+                    n_repeats=args.repeats,
+                    seed_offset=0,
+                )
             summary = summarize_estimates(estimates, reference_nats_per_token)
             row = {
                 "n_steps": int(n_steps),
