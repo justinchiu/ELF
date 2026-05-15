@@ -247,6 +247,12 @@ def parse_args():
     p.add_argument("--steps", type=str, default="16,32")
     p.add_argument("--probes", type=str, default="1,4")
     p.add_argument("--repeats", type=int, default=4)
+    p.add_argument("--reference_steps", type=int, default=0,
+                   help="High-budget step count for reference estimate; 0 disables reference/MSE.")
+    p.add_argument("--reference_probes", type=int, default=0,
+                   help="High-budget probe count for reference estimate; 0 disables reference/MSE.")
+    p.add_argument("--reference_repeats", type=int, default=1,
+                   help="Number of high-budget reference repeats to average.")
     p.add_argument("--probe_dist", type=str, default="rademacher",
                    choices=["rademacher", "gaussian"])
     p.add_argument("--seed", type=int, default=42)
@@ -258,6 +264,88 @@ def parse_args():
                    help="Initialize JAX distributed. Use only for worker=all full-pod runs.")
     p.add_argument("--use_cpu", action="store_true")
     return p.parse_args()
+
+
+def parse_int_list(value):
+    return [int(s.strip()) for s in value.split(",") if s.strip()]
+
+
+def run_likelihood_repeats(
+    velocity_fn,
+    x0,
+    attention_mask,
+    n_steps,
+    n_probes,
+    probe_dist,
+    rng,
+    prior_scale,
+    n_repeats,
+    seed_offset,
+):
+    tic = time.time()
+    ll_repeats, n_valid_repeats, z0_norms = [], [], []
+    for r in range(n_repeats):
+        seed_r = jax.random.fold_in(
+            rng, seed_offset + r * 1_000_003 + n_steps * 1_009 + n_probes
+        )
+        log_p, n_valid, z0 = log_likelihood(
+            velocity_fn, x0, n_steps, n_probes, probe_dist, seed_r,
+            prior_scale, attention_mask,
+        )
+        log_p.block_until_ready()
+        ll_repeats.append(np.asarray(log_p))
+        n_valid_repeats.append(np.asarray(n_valid))
+        z0_norms.append(float(jnp.sqrt(jnp.mean(z0 ** 2))))
+
+    ll = np.stack(ll_repeats, axis=0)       # (R, B)
+    n_valid = np.stack(n_valid_repeats, axis=0)
+    nats_per_token = -ll / np.maximum(n_valid, 1.0)
+    runtime_s = time.time() - tic
+    return {
+        "ll": ll,
+        "n_valid": n_valid,
+        "nats_per_token": nats_per_token,
+        "z0_norms": np.asarray(z0_norms),
+        "runtime_s": runtime_s,
+    }
+
+
+def summarize_estimates(estimates, reference_nats_per_token=None):
+    ll = estimates["ll"]
+    n_valid = estimates["n_valid"]
+    nats_per_token = estimates["nats_per_token"]
+    per_example_mean = nats_per_token.mean(axis=0)
+    per_example_var = nats_per_token.var(axis=0)
+    row = {
+        "mean_ll": float(ll.mean()),
+        "std_ll_across_repeats_per_example": float(ll.std(axis=0).mean()),
+        "std_ll_across_examples_per_repeat": float(ll.std(axis=1).mean()),
+        "mean_nats_per_token": float(nats_per_token.mean()),
+        "token_weighted_nats_per_token": float(
+            -ll.sum() / np.maximum(n_valid.sum(), 1.0)
+        ),
+        "std_nats_per_token_across_repeats": float(nats_per_token.std(axis=0).mean()),
+        "mean_z0_rms": float(np.mean(estimates["z0_norms"])),
+        "nan_count": int(np.isnan(ll).sum()),
+        "inf_count": int(np.isinf(ll).sum()),
+        "runtime_s": float(estimates["runtime_s"]),
+    }
+    if reference_nats_per_token is not None:
+        errors = nats_per_token - reference_nats_per_token[None, :]
+        bias = per_example_mean - reference_nats_per_token
+        bias2 = float(np.mean(bias ** 2))
+        variance = float(np.mean(per_example_var))
+        mse = float(np.mean(errors ** 2))
+        row.update({
+            "reference_mean_nats_per_token": float(reference_nats_per_token.mean()),
+            "mean_error_vs_reference": float(errors.mean()),
+            "bias2_vs_reference": bias2,
+            "variance_across_repeats": variance,
+            "mse_vs_reference": mse,
+            "rmse_vs_reference": float(np.sqrt(mse)),
+            "mse_decomposition_error": float(mse - (bias2 + variance)),
+        })
+    return row
 
 
 def main():
@@ -350,8 +438,8 @@ def main():
     n_tokens = int(attention_mask.sum())
     log_for_0(f"  x0 shape: {x0.shape}, valid tokens: {n_tokens}")
 
-    steps_list = [int(s) for s in args.steps.split(",")]
-    probes_list = [int(p) for p in args.probes.split(",")]
+    steps_list = parse_int_list(args.steps)
+    probes_list = parse_int_list(args.probes)
     prior_scale = float(config.denoiser_noise_scale)
 
     log_for_0(
@@ -359,28 +447,54 @@ def main():
         f"probe_dist={args.probe_dist}  prior_scale={prior_scale}"
     )
 
+    reference = None
+    reference_nats_per_token = None
+    if args.reference_steps > 0 or args.reference_probes > 0:
+        if args.reference_steps <= 0 or args.reference_probes <= 0:
+            raise ValueError("--reference_steps and --reference_probes must both be positive to use a reference")
+        log_for_0(
+            f"Reference: steps={args.reference_steps} probes={args.reference_probes} "
+            f"repeats={args.reference_repeats}"
+        )
+        reference = run_likelihood_repeats(
+            velocity_fn=velocity_fn,
+            x0=x0,
+            attention_mask=attention_mask,
+            n_steps=args.reference_steps,
+            n_probes=args.reference_probes,
+            probe_dist=args.probe_dist,
+            rng=rng,
+            prior_scale=prior_scale,
+            n_repeats=args.reference_repeats,
+            seed_offset=100_000_000,
+        )
+        reference_nats_per_token = reference["nats_per_token"].mean(axis=0)
+        ref_row = summarize_estimates(reference)
+        log_for_0(
+            f"[reference] mean_nats/tok={ref_row['mean_nats_per_token']:.6f} "
+            f"token_weighted={ref_row['token_weighted_nats_per_token']:.6f} "
+            f"runtime={ref_row['runtime_s']:.1f}s"
+        )
+
     results = []
     per_example_estimates = {}
+    per_example_nats_per_token = {}
     for n_steps in steps_list:
         for n_probes in probes_list:
             key = f"steps{n_steps}_probes{n_probes}"
-            tic = time.time()
-            ll_repeats, z0_norms = [], []
-            for r in range(args.repeats):
-                seed_r = jax.random.fold_in(rng, r * 10000 + n_steps * 100 + n_probes)
-                log_p, n_valid, z0 = log_likelihood(
-                    velocity_fn, x0, n_steps, n_probes, args.probe_dist, seed_r,
-                    prior_scale, attention_mask,
-                )
-                log_p.block_until_ready()
-                ll_repeats.append((np.asarray(log_p), np.asarray(n_valid)))
-                z0_norms.append(float(jnp.sqrt(jnp.mean(z0 ** 2))))
-            t_elapsed = time.time() - tic
-
-            ll = np.stack([a for a, _ in ll_repeats], axis=0)  # (R, B)
-            nv = np.stack([b for _, b in ll_repeats], axis=0)  # (R, B)
-            nats_per_tok = -ll / np.maximum(nv, 1.0)            # NLL/token, (R, B)
-
+            estimates = run_likelihood_repeats(
+                velocity_fn=velocity_fn,
+                x0=x0,
+                attention_mask=attention_mask,
+                n_steps=n_steps,
+                n_probes=n_probes,
+                probe_dist=args.probe_dist,
+                rng=rng,
+                prior_scale=prior_scale,
+                n_repeats=args.repeats,
+                seed_offset=0,
+            )
+            summary = summarize_estimates(estimates, reference_nats_per_token)
             row = {
                 "n_steps": int(n_steps),
                 "n_probes": int(n_probes),
@@ -388,37 +502,49 @@ def main():
                 "n_examples": int(args.num_examples),
                 "probe_dist": args.probe_dist,
                 "prior_scale": prior_scale,
-                "mean_ll": float(ll.mean()),
-                "std_ll_across_repeats_per_example": float(ll.std(axis=0).mean()),
-                "std_ll_across_examples_per_repeat": float(ll.std(axis=1).mean()),
-                "mean_nats_per_token": float(nats_per_tok.mean()),
-                "std_nats_per_token_across_repeats": float(nats_per_tok.std(axis=0).mean()),
-                "mean_z0_rms": float(np.mean(z0_norms)),
-                "nan_count": int(np.isnan(ll).sum()),
-                "inf_count": int(np.isinf(ll).sum()),
-                "runtime_s": float(t_elapsed),
+                **summary,
             }
-            log_for_0(
+            msg = (
                 f"[{key}] mean_ll={row['mean_ll']:+.2f}  "
                 f"std_ll(repeats,/ex)={row['std_ll_across_repeats_per_example']:.3f}  "
                 f"nats/tok={row['mean_nats_per_token']:.3f} "
                 f"± {row['std_nats_per_token_across_repeats']:.3f}  "
-                f"z0_rms={row['mean_z0_rms']:.3f}  "
-                f"runtime={t_elapsed:.1f}s"
+                f"z0_rms={row['mean_z0_rms']:.3f}"
             )
+            if reference_nats_per_token is not None:
+                msg += (
+                    f"  mse={row['mse_vs_reference']:.6g}"
+                    f"  bias2={row['bias2_vs_reference']:.6g}"
+                    f"  var={row['variance_across_repeats']:.6g}"
+                    f"  rmse={row['rmse_vs_reference']:.6g}"
+                )
+            msg += f"  runtime={row['runtime_s']:.1f}s"
+            log_for_0(msg)
             results.append(row)
-            per_example_estimates[key] = ll
+            per_example_estimates[key] = estimates["ll"]
+            per_example_nats_per_token[key] = estimates["nats_per_token"]
 
     if jax.process_index() == 0:
         with open(os.path.join(args.output_dir, "results.jsonl"), "w") as f:
             for r in results:
                 f.write(json.dumps(r) + "\n")
+        summary = {"args": vars(args), "results": results}
+        if reference is not None:
+            summary["reference"] = {
+                "n_steps": args.reference_steps,
+                "n_probes": args.reference_probes,
+                "n_repeats": args.reference_repeats,
+                **summarize_estimates(reference),
+            }
         with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
-            json.dump({"args": vars(args), "results": results}, f, indent=2)
-        np.savez(
-            os.path.join(args.output_dir, "per_example_estimates.npz"),
-            **per_example_estimates,
-        )
+            json.dump(summary, f, indent=2)
+        npz_payload = {f"ll_{k}": v for k, v in per_example_estimates.items()}
+        npz_payload.update({f"nats_per_token_{k}": v for k, v in per_example_nats_per_token.items()})
+        if reference is not None:
+            npz_payload["ll_reference"] = reference["ll"]
+            npz_payload["nats_per_token_reference"] = reference["nats_per_token"]
+            npz_payload["nats_per_token_reference_mean"] = reference_nats_per_token
+        np.savez(os.path.join(args.output_dir, "per_example_estimates.npz"), **npz_payload)
         log_for_0(
             f"Wrote {args.output_dir}/"
             f"{{results.jsonl, summary.json, per_example_estimates.npz}}"

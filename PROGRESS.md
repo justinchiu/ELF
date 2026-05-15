@@ -11,6 +11,9 @@ Branch: `elbo-uv`
   - Backward Euler integration from `t=1` to `t=0`.
   - Masked padded positions consistently in the ODE path and prior term.
   - Distributed JAX init is opt-in via `--distributed`.
+  - Optional high-budget reference estimates via `--reference_steps`,
+    `--reference_probes`, and `--reference_repeats`.
+  - Per-setting `bias^2`, repeat variance, MSE, and RMSE against the reference.
 - Added and hardened `scripts/run_on_fresh_tpu.sh`:
   - Recreates `PREEMPTED` v5p-64 spot pods.
   - Reuses `READY` pods by default.
@@ -112,11 +115,27 @@ RUN_WORKERS=all scripts/run_on_fresh_tpu.sh "python eval_elf_loss.py \
   --repeats 1"
 ```
 
-4. If the smoke test succeeds, choose a clear evaluation set:
+4. Run the single-example latent CNF estimator convergence check:
+
+```bash
+scripts/run_on_fresh_tpu.sh "python eval_elbo_variance.py \
+  --config configs/training_configs/train_owt_ELF-B.yml \
+  --checkpoint_path embedded-language-flows/ELF-B-owt \
+  --num_examples 1 \
+  --max_length 128 \
+  --steps 16,32,64,128 \
+  --probes 1,2,4,8,16 \
+  --repeats 16 \
+  --reference_steps 512 \
+  --reference_probes 256 \
+  --reference_repeats 4"
+```
+
+5. If the smoke test succeeds, choose a clear evaluation set:
   - External OWT test/eval path if available.
   - Otherwise a deterministic pseudo-heldout slice, documented by `[start_index, end_index)`.
 
-5. For a real distributed run, make sure the node is recreated and all 8 hosts are bootstrapped.
+6. For a real distributed run, make sure the node is recreated and all 8 hosts are bootstrapped.
 
 ## TPU Cleanup
 
