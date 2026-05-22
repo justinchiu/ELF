@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Run a small grid of unbiased full-support time proposals for eval_elbo_bound.py.
 # Intended to be launched on all TPU workers from the repo root.
+# Set GCS_OUTPUT_ROOT=gs://... to sync each completed config to durable storage.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}/src"
@@ -19,9 +20,17 @@ REFERENCE_REPEATS="${REFERENCE_REPEATS:-2}"
 POSTERIOR_SIGMAS="${POSTERIOR_SIGMAS:-0.05 0.1 0.2 0.4 1.0}"
 DISTRIBUTED="${DISTRIBUTED:-1}"
 STREAMING="${STREAMING:-1}"
+GCS_OUTPUT_ROOT="${GCS_OUTPUT_ROOT:-}"
+GCS_SYNC_RETRIES="${GCS_SYNC_RETRIES:-3}"
+GCS_SYNC_RETRY_SECONDS="${GCS_SYNC_RETRY_SECONDS:-15}"
 
 if [[ "${OUTPUT_ROOT}" != /* ]]; then
   OUTPUT_ROOT="${REPO_ROOT}/${OUTPUT_ROOT}"
+fi
+
+if [[ -n "${GCS_OUTPUT_ROOT}" && "${GCS_OUTPUT_ROOT}" != gs://* ]]; then
+  echo "GCS_OUTPUT_ROOT must be a gs:// path, got: ${GCS_OUTPUT_ROOT}" >&2
+  exit 1
 fi
 
 COMMON_ARGS=(
@@ -50,6 +59,37 @@ run_one() {
     "${COMMON_ARGS[@]}" \
     --output_dir "${OUTPUT_ROOT}/${name}" \
     "$@"
+  sync_one "${name}"
+}
+
+sync_one() {
+  local name="$1"
+  local local_dir="${OUTPUT_ROOT}/${name}"
+  local remote_dir="${GCS_OUTPUT_ROOT}/${name}"
+  local attempt
+
+  if [[ -z "${GCS_OUTPUT_ROOT}" ]]; then
+    return 0
+  fi
+
+  # Only the JAX process-0 host writes summary.json. Non-writing hosts run this
+  # script too, but should not fail or create empty GCS directories.
+  if [[ ! -f "${local_dir}/summary.json" ]]; then
+    echo "No local summary for ${name} on $(hostname); skipping GCS sync."
+    return 0
+  fi
+
+  for attempt in $(seq 1 "${GCS_SYNC_RETRIES}"); do
+    echo "Syncing ${local_dir} -> ${remote_dir} (attempt ${attempt}/${GCS_SYNC_RETRIES})"
+    if gcloud storage rsync --recursive "${local_dir}" "${remote_dir}"; then
+      echo "Synced ${name} to ${remote_dir}"
+      return 0
+    fi
+    sleep "${GCS_SYNC_RETRY_SECONDS}"
+  done
+
+  echo "Failed to sync ${name} to ${remote_dir}" >&2
+  return 1
 }
 
 for sigma in ${POSTERIOR_SIGMAS}; do
