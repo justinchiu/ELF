@@ -1,5 +1,55 @@
 # Plan: Evaluate ELF-B-owt ELBO Estimator Variance
 
+## 2026-05-22 Update
+
+This plan is now historical. The CNF path below was useful for diagnosing
+Hutchinson variance and ODE discretization bias, but it is not the current
+answer to the ELF likelihood question.
+
+Current guidance:
+
+- Primary evaluator: `src/eval_elbo_bound.py`.
+- Primary question: bias and variance of the Monte Carlo ELF token-level ELBO estimator at practical budgets.
+- Current bound: `p(tokens,z)=p_flow(z)p_decoder(tokens|z)` with `q(z|tokens)=N(E(tokens), sigma_q^2 I)`, reporting latent flow NELBO + latent endpoint constant + decoder token NLL + analytic `log q`.
+- Sweep/fix `--posterior_sigma` and the time proposal. Use full-support proposals for a strict bound; `truncated_uniform` is only a biased endpoint-truncation diagnostic. This grid changes only MC proposals, not ELF's fixed noising schedule.
+- Select proposals by cross-proposal mean agreement, repeat variance scaling, max/mean importance-weight ratios, and ESS fraction.
+- Auxiliary only: `src/eval_elbo_variance.py`, which computes a zero-self-conditioning CNF density for an artificial deterministic vector field.
+- Auxiliary only: `src/eval_elf_loss.py`, which reproduces the training objective mixture and is not an ELBO or likelihood metric.
+
+Current TPU launch shape:
+
+```bash
+gcloud compute tpus tpu-vm ssh elf-elbo-v5p64-spot \
+  --project=pivotal-shield-449921-d4 --zone=us-east5-a \
+  --worker=all --batch-size=8 \
+  --command="cd ~/ELF && scripts/run_elbo_estimator_grid.sh 2>&1 | tee /tmp/eval_elbo_grid.log"
+```
+
+Single-estimator launch shape:
+
+```bash
+gcloud compute tpus tpu-vm ssh elf-elbo-v5p64-spot \
+  --project=pivotal-shield-449921-d4 --zone=us-east5-a \
+  --worker=all --batch-size=8 \
+  --command="cd ~/ELF/src && python eval_elbo_bound.py \
+    --config configs/training_configs/train_owt_ELF-B.yml \
+    --checkpoint_path embedded-language-flows/ELF-B-owt \
+    --distributed \
+    --streaming \
+    --num_examples 512 \
+    --global_batch_size 512 \
+    --mc_samples 16 \
+    --repeats 8 \
+    --reference_mc_samples 256 \
+    --reference_repeats 2 \
+    --posterior_sigma 0.2 \
+    --time_proposal sigmoid_normal \
+    --time_proposal_scale 2.0 \
+    2>&1 | tee /tmp/eval_elbo_bound.log"
+```
+
+Do not treat the "Primary diagnostic: latent CNF likelihood" section below as current guidance for ELF-B-owt. The current conclusion is that token-level ELBO estimation, not training-loss evaluation and not deterministic CNF integration, is the metric that matters.
+
 ## Goal
 
 Evaluate whether ELBO / likelihood estimation for the smallest ELF model is dominated by estimator variance.
@@ -21,9 +71,9 @@ The core question is therefore not "what is one ELBO number?" but:
 
 > At practical compute budgets, is the ELF-B-owt ELBO / likelihood estimator stable enough to be useful?
 
-## Evaluation Targets
+## Historical Evaluation Targets
 
-### 1. Primary diagnostic: latent CNF likelihood
+### 1. Historical diagnostic: latent CNF likelihood
 
 Evaluate the continuous latent likelihood of frozen T5-encoded OWT examples under the ELF flow.
 
@@ -40,7 +90,7 @@ p_0 = N(0, denoiser_noise_scale^2 I)
 denoiser_noise_scale = 2.0 for ELF-B-owt
 ```
 
-This target isolates the flow likelihood estimator before adding token-decoder ELBO terms.
+This target isolates CNF integration behavior before adding token-decoder ELBO terms. It is now considered a diagnostic only, not the recommended ELF likelihood estimator.
 
 ### 2. Secondary diagnostic: token-level ELBO
 

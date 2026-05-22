@@ -1,13 +1,20 @@
 #!/usr/bin/env python
-"""Latent-CNF likelihood variance evaluator for ELF flow-matching models.
+"""Zero-self-conditioning CNF diagnostic for ELF flow-matching models.
 
-Implements the primary diagnostic from PLAN.md:
+This is not the primary ELF ELBO estimator. It computes a well-defined density
+for an artificial deterministic vector field obtained by fixing the
+self-conditioning input to zeros and setting self-conditioning CFG to 1.0:
 
     log p_1(x_1) = log p_0(z_0) - ∫_0^1 div v_θ(z_t, t) dt
 
 with a backward Euler ODE integrator, Hutchinson divergence estimator, and a
-Gaussian prior p_0 = N(0, denoiser_noise_scale^2 I). The script is set up for
-the "Initial Minimal Run" smoke test before the full sweep.
+Gaussian prior p_0 = N(0, denoiser_noise_scale^2 I).
+
+Use this script to study CNF integration/probe behavior only. It should not be
+reported as the likelihood of the released ELF sampler, which is recurrently
+self-conditioned and SDE-based, and it should not be the main answer to the
+ELBO-estimation question. Use eval_elbo_bound.py for current ELBO/proxy
+bias/variance experiments.
 
 Self-conditioning is disabled at eval (second-half input fixed to zeros, CFG
 scale fixed to 1.0, decoder gating off) so the trained model exposes a
@@ -241,7 +248,12 @@ def load_owt_examples(num_examples, max_length, pad_token_id, split, seed):
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description=(
+            "Diagnostic zero-self-cond CNF sweep. This is not the primary ELF "
+            "ELBO/proxy estimator; use eval_elbo_bound.py for that."
+        )
+    )
     p.add_argument("--config", type=str, required=False)
     p.add_argument("--checkpoint_path", type=str, required=False)
     p.add_argument("--num_examples", type=int, default=8)
@@ -494,6 +506,10 @@ def main():
         f"hosts={jax.process_count()} local_devices={jax.local_device_count()} "
         f"global_devices={jax.device_count()}"
     )
+    log_for_0(
+        "Diagnostic only: this evaluates an artificial zero-self-cond CNF "
+        "density, not the released self-conditioned/SDE sampler likelihood."
+    )
 
     log_for_0("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -660,6 +676,12 @@ def main():
                 )
             summary = summarize_estimates(estimates, reference_nats_per_token)
             row = {
+                "metric": "zero_self_cond_cnf_nats_per_token",
+                "diagnostic_only": True,
+                "interpretation": (
+                    "Artificial deterministic CNF with self-conditioning fixed "
+                    "to zeros; not the released ELF sampler likelihood."
+                ),
                 "n_steps": int(n_steps),
                 "n_probes": int(n_probes),
                 "n_repeats": int(args.repeats),
@@ -692,7 +714,13 @@ def main():
         with open(os.path.join(args.output_dir, "results.jsonl"), "w") as f:
             for r in results:
                 f.write(json.dumps(r) + "\n")
-        summary = {"args": vars(args), "results": results}
+        summary = {
+            "metric": "zero_self_cond_cnf_nats_per_token",
+            "diagnostic_only": True,
+            "recommended_primary_evaluator": "src/eval_elbo_bound.py",
+            "args": vars(args),
+            "results": results,
+        }
         if reference is not None:
             summary["reference"] = {
                 "n_steps": args.reference_steps,

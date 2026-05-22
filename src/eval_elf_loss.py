@@ -1,10 +1,13 @@
 #!/usr/bin/env python
-"""Evaluate the ELF training objective on a dataset shard.
+"""Auxiliary evaluator for the ELF training objective on a dataset shard.
 
 This computes the same two conditional losses used by train_step.py, without
 gradients:
 
   expected_loss = (1 - decoder_prob) * denoiser_l2 + decoder_prob * decoder_ce
+
+This is not a likelihood, not an ELBO, and not the metric for ELF estimator
+bias/variance. Use eval_elbo_bound.py for the current ELBO/proxy question.
 
 The evaluator is written for multi-host TPU runs. Dataset distribution is
 handled by utils.data_utils.get_dataloader(..., distributed=True), which uses a
@@ -75,7 +78,12 @@ def maybe_initialize_distributed(enabled):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate ELF training loss.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Auxiliary ELF training-loss evaluator. Not a likelihood/ELBO "
+            "metric; use eval_elbo_bound.py for ELBO/proxy bias and variance."
+        )
+    )
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument(
@@ -502,6 +510,9 @@ def main():
     ce_loss = totals["ce_sum"] / ce_token_count
     expected_loss = (1.0 - config.decoder_prob) * l2_loss + config.decoder_prob * ce_loss
     result = {
+        "metric": "auxiliary_training_objective_loss",
+        "diagnostic_only": True,
+        "recommended_primary_evaluator": "src/eval_elbo_bound.py",
         "checkpoint_path": args.checkpoint_path,
         "param_source": args.param_source,
         "data_path": data_path,
