@@ -43,6 +43,7 @@ import copy
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from functools import partial
@@ -178,6 +179,27 @@ def parse_args():
     )
     parser.add_argument(
         "--output_dir", type=str, default="outputs/elbo_bound/elf_b_owt",
+    )
+    parser.add_argument(
+        "--gcs_output_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional gs:// destination. On JAX process 0, output_dir is rsynced "
+            "after each reference/repeat progress write and at completion."
+        ),
+    )
+    parser.add_argument(
+        "--gcs_sync_retries",
+        type=int,
+        default=3,
+        help="Number of attempts for each incremental GCS sync.",
+    )
+    parser.add_argument(
+        "--gcs_sync_retry_seconds",
+        type=int,
+        default=15,
+        help="Seconds to wait between GCS sync attempts.",
     )
     parser.add_argument("--distributed", action="store_true")
     parser.add_argument("--use_cpu", action="store_true")
@@ -604,6 +626,96 @@ def summarize_repeats(rows, reference_mean=None):
     return summary
 
 
+def atomic_write_json(path, payload):
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, path)
+
+
+def write_jsonl(path, rows):
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    os.replace(tmp_path, path)
+
+
+def sync_output_dir_to_gcs(args):
+    if jax.process_index() != 0 or not args.gcs_output_dir:
+        return
+    if not args.gcs_output_dir.startswith("gs://"):
+        raise ValueError(f"--gcs_output_dir must be a gs:// path, got: {args.gcs_output_dir}")
+
+    local_dir = str(Path(args.output_dir))
+    command = [
+        "gcloud",
+        "storage",
+        "rsync",
+        "--recursive",
+        local_dir,
+        args.gcs_output_dir,
+    ]
+    retries = max(1, args.gcs_sync_retries)
+    for attempt in range(1, retries + 1):
+        try:
+            subprocess.run(command, check=True)
+            log_for_0(f"Synced {local_dir} -> {args.gcs_output_dir}")
+            return
+        except (OSError, subprocess.CalledProcessError) as exc:
+            if attempt == retries:
+                log_for_0(
+                    f"WARNING: failed to sync {local_dir} -> {args.gcs_output_dir}: {exc}"
+                )
+                return
+            log_for_0(
+                f"WARNING: sync attempt {attempt}/{retries} failed for "
+                f"{args.gcs_output_dir}: {exc}; retrying"
+            )
+            time.sleep(max(0, args.gcs_sync_retry_seconds))
+
+
+def write_incremental_outputs(
+    args,
+    run_metadata,
+    reference_rows,
+    repeat_rows,
+    status,
+    start_time,
+    reference_mean=None,
+    sync=True,
+):
+    if jax.process_index() != 0:
+        return
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    atomic_write_json(output_dir / "run_config.json", run_metadata)
+    write_jsonl(output_dir / "reference.jsonl", reference_rows)
+    write_jsonl(output_dir / "repeats.jsonl", repeat_rows)
+
+    partial_summary = summarize_repeats(repeat_rows, reference_mean) if repeat_rows else None
+    now = time.time()
+    progress = {
+        "status": status,
+        "updated_unix_s": now,
+        "elapsed_s": now - start_time,
+        "reference_completed": len(reference_rows),
+        "reference_repeats": args.reference_repeats if args.reference_mc_samples > 0 else 0,
+        "repeats_completed": len(repeat_rows),
+        "repeats": args.repeats,
+        "current_reference_mean": reference_mean,
+        "summary": partial_summary,
+    }
+    atomic_write_json(output_dir / "progress.json", progress)
+    if sync:
+        sync_output_dir_to_gcs(args)
+
+
 def main():
     args = parse_args()
     maybe_initialize_distributed(args.distributed)
@@ -615,6 +727,12 @@ def main():
         raise ValueError("--time_proposal_scale must be > 0")
     if args.time_proposal_alpha <= 0 or args.time_proposal_beta <= 0:
         raise ValueError("--time_proposal_alpha and --time_proposal_beta must be > 0")
+    if args.gcs_output_dir and not args.gcs_output_dir.startswith("gs://"):
+        raise ValueError(f"--gcs_output_dir must be a gs:// path, got: {args.gcs_output_dir}")
+    if args.gcs_sync_retries <= 0:
+        raise ValueError("--gcs_sync_retries must be > 0")
+    if args.gcs_sync_retry_seconds < 0:
+        raise ValueError("--gcs_sync_retry_seconds must be >= 0")
 
     config = load_config_from_yaml(args.config)
     if args.config_override:
@@ -665,6 +783,35 @@ def main():
     log_for_0(
         f"Dataset full_len={full_len}, selected=[{start_index}, {end_index}), "
         f"selected_examples_global={selected_examples}, streaming={args.streaming}"
+    )
+    start_time = time.time()
+    run_metadata = {
+        "status": "running",
+        "metric": "token_level_elbo_bias_variance",
+        "argv": sys.argv,
+        "args": vars(args),
+        "checkpoint_path": args.checkpoint_path,
+        "param_source": args.param_source,
+        "data_path": data_path,
+        "dataset_full_len": full_len,
+        "selected_start_index": start_index,
+        "selected_end_index": end_index,
+        "selected_examples_global": selected_examples,
+        "streaming": args.streaming,
+        "global_batch_size": config.global_batch_size,
+        "hosts": num_hosts,
+        "local_devices": num_local_devices,
+        "global_devices": num_devices,
+        "denoiser_noise_scale": config.denoiser_noise_scale,
+        "created_unix_s": start_time,
+    }
+    write_incremental_outputs(
+        args,
+        run_metadata,
+        reference_rows=[],
+        repeat_rows=[],
+        status="initializing",
+        start_time=start_time,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or config.encoder_model_name)
@@ -750,7 +897,6 @@ def main():
 
     reference_rows = []
     reference_mean = None
-    start_time = time.time()
     if args.reference_mc_samples > 0:
         log_for_0(
             f"Reference estimate: mc_samples={args.reference_mc_samples}, "
@@ -758,20 +904,40 @@ def main():
         )
         for ref_idx in range(args.reference_repeats):
             ref_rng = jax.random.fold_in(rng, 1_000_000 + ref_idx)
-            reference_rows.append(
-                estimate_once(
-                    dataloader,
-                    state,
-                    encoder_params,
-                    p_eval_step,
-                    config,
-                    ref_rng,
-                    args.reference_mc_samples,
-                    num_local_devices,
-                )
+            row = estimate_once(
+                dataloader,
+                state,
+                encoder_params,
+                p_eval_step,
+                config,
+                ref_rng,
+                args.reference_mc_samples,
+                num_local_devices,
+            )
+            row["reference_idx"] = ref_idx
+            reference_rows.append(row)
+            write_incremental_outputs(
+                args,
+                run_metadata,
+                reference_rows,
+                repeat_rows=[],
+                status="running_reference",
+                start_time=start_time,
+                reference_mean=float(np.mean([
+                    item["token_nelbo_per_token"] for item in reference_rows
+                ])),
             )
         reference_mean = float(np.mean([row["token_nelbo_per_token"] for row in reference_rows]))
         log_for_0(f"Reference token_nelbo_per_token={reference_mean:.6f}")
+        write_incremental_outputs(
+            args,
+            run_metadata,
+            reference_rows,
+            repeat_rows=[],
+            status="reference_complete",
+            start_time=start_time,
+            reference_mean=reference_mean,
+        )
 
     repeat_rows = []
     for repeat_idx in range(args.repeats):
@@ -806,6 +972,15 @@ def main():
         if reference_mean is not None:
             msg += f" error_vs_reference={row['token_nelbo_per_token'] - reference_mean:+.6f}"
         log_for_0(msg)
+        write_incremental_outputs(
+            args,
+            run_metadata,
+            reference_rows,
+            repeat_rows,
+            status="running_repeats",
+            start_time=start_time,
+            reference_mean=reference_mean,
+        )
 
     elapsed = time.time() - start_time
     summary = summarize_repeats(repeat_rows, reference_mean=reference_mean)
@@ -859,17 +1034,35 @@ def main():
     }
 
     if jax.process_index() == 0:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        summary_path = Path(args.output_dir) / "summary.json"
-        repeats_path = Path(args.output_dir) / "repeats.jsonl"
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
-            f.write("\n")
-        with open(repeats_path, "w", encoding="utf-8") as f:
-            for row in repeat_rows:
-                f.write(json.dumps(row) + "\n")
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = output_dir / "summary.json"
+        repeats_path = output_dir / "repeats.jsonl"
+        reference_path = output_dir / "reference.jsonl"
+        final_metadata = dict(run_metadata)
+        final_metadata.update({
+            "status": "complete",
+            "completed_unix_s": time.time(),
+            "elapsed_s": elapsed,
+        })
+        atomic_write_json(output_dir / "run_config.json", final_metadata)
+        atomic_write_json(summary_path, result)
+        write_jsonl(reference_path, reference_rows)
+        write_jsonl(repeats_path, repeat_rows)
+        atomic_write_json(output_dir / "progress.json", {
+            "status": "complete",
+            "updated_unix_s": time.time(),
+            "elapsed_s": elapsed,
+            "reference_completed": len(reference_rows),
+            "reference_repeats": args.reference_repeats if args.reference_mc_samples > 0 else 0,
+            "repeats_completed": len(repeat_rows),
+            "repeats": args.repeats,
+            "current_reference_mean": reference_mean,
+            "summary": summary,
+        })
         log_for_0(json.dumps(result["summary"], indent=2))
-        log_for_0(f"Wrote {summary_path} and {repeats_path}")
+        log_for_0(f"Wrote {summary_path}, {reference_path}, and {repeats_path}")
+        sync_output_dir_to_gcs(args)
 
 
 if __name__ == "__main__":

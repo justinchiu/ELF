@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Run a small grid of unbiased full-support time proposals for eval_elbo_bound.py.
 # Intended to be launched on all TPU workers from the repo root.
-# Set GCS_OUTPUT_ROOT=gs://... to sync each completed config to durable storage.
+# Set GCS_OUTPUT_ROOT=gs://... to sync each config's incremental progress to durable storage.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}/src"
@@ -54,12 +54,30 @@ fi
 run_one() {
   local name="$1"
   shift
+  local status=0
+  local gcs_args=()
+
+  if [[ -n "${GCS_OUTPUT_ROOT}" ]]; then
+    gcs_args=(
+      --gcs_output_dir "${GCS_OUTPUT_ROOT}/${name}"
+      --gcs_sync_retries "${GCS_SYNC_RETRIES}"
+      --gcs_sync_retry_seconds "${GCS_SYNC_RETRY_SECONDS}"
+    )
+  fi
+
   echo "=== ELBO estimator grid: ${name} ==="
   python eval_elbo_bound.py \
     "${COMMON_ARGS[@]}" \
     --output_dir "${OUTPUT_ROOT}/${name}" \
-    "$@"
-  sync_one "${name}"
+    "${gcs_args[@]}" \
+    "$@" || status=$?
+
+  if ! sync_one "${name}"; then
+    if [[ "${status}" -eq 0 ]]; then
+      return 1
+    fi
+  fi
+  return "${status}"
 }
 
 sync_one() {
@@ -72,10 +90,10 @@ sync_one() {
     return 0
   fi
 
-  # Only the JAX process-0 host writes summary.json. Non-writing hosts run this
+  # Only the JAX process-0 host writes output files. Non-writing hosts run this
   # script too, but should not fail or create empty GCS directories.
-  if [[ ! -f "${local_dir}/summary.json" ]]; then
-    echo "No local summary for ${name} on $(hostname); skipping GCS sync."
+  if [[ ! -d "${local_dir}" ]] || [[ -z "$(find "${local_dir}" -type f -print -quit)" ]]; then
+    echo "No local outputs for ${name} on $(hostname); skipping GCS sync."
     return 0
   fi
 
