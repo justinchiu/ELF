@@ -4,6 +4,7 @@ set -euo pipefail
 # Run a small grid of unbiased full-support time proposals for eval_elbo_bound.py.
 # Intended to be launched on all TPU workers from the repo root.
 # Set GCS_OUTPUT_ROOT=gs://... to sync each config's incremental progress to durable storage.
+# With SKIP_COMPLETED=1, configs with an existing summary.json are skipped.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}/src"
@@ -23,6 +24,7 @@ STREAMING="${STREAMING:-1}"
 GCS_OUTPUT_ROOT="${GCS_OUTPUT_ROOT:-}"
 GCS_SYNC_RETRIES="${GCS_SYNC_RETRIES:-3}"
 GCS_SYNC_RETRY_SECONDS="${GCS_SYNC_RETRY_SECONDS:-15}"
+SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 
 if [[ "${OUTPUT_ROOT}" != /* ]]; then
   OUTPUT_ROOT="${REPO_ROOT}/${OUTPUT_ROOT}"
@@ -57,6 +59,10 @@ run_one() {
   local status=0
   local gcs_args=()
 
+  if should_skip "${name}"; then
+    return 0
+  fi
+
   if [[ -n "${GCS_OUTPUT_ROOT}" ]]; then
     gcs_args=(
       --gcs_output_dir "${GCS_OUTPUT_ROOT}/${name}"
@@ -78,6 +84,28 @@ run_one() {
     fi
   fi
   return "${status}"
+}
+
+should_skip() {
+  local name="$1"
+  local local_summary="${OUTPUT_ROOT}/${name}/summary.json"
+  local remote_summary="${GCS_OUTPUT_ROOT}/${name}/summary.json"
+
+  if [[ "${SKIP_COMPLETED}" != "1" ]]; then
+    return 1
+  fi
+
+  if [[ -f "${local_summary}" ]]; then
+    echo "=== ELBO estimator grid: ${name} already complete locally; skipping ==="
+    return 0
+  fi
+
+  if [[ -n "${GCS_OUTPUT_ROOT}" ]] && gcloud storage ls "${remote_summary}" >/dev/null 2>&1; then
+    echo "=== ELBO estimator grid: ${name} already complete in GCS; skipping ==="
+    return 0
+  fi
+
+  return 1
 }
 
 sync_one() {
