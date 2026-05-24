@@ -33,8 +33,10 @@ where SNR(t) = t^2 / ((1 - t)^2 sigma^2).
 This is still not the released self-conditioned/SDE sampler likelihood and not
 the zero-self-cond CNF diagnostic. The bound depends on the chosen
 posterior_sigma; sweep it before treating the number as a model comparison.
-Use the default full-support sigmoid-normal time proposal for a strict bound;
-truncated-uniform time sampling is a biased diagnostic.
+Use the default full-support sigmoid-normal time proposal with t_max=1 for the
+strict clean-latent diagnostic. Set --t_max < 1 and/or --weight_mode
+clamped_vpred only for a truncated latent proxy matched to ELF's finite
+training objective.
 """
 
 import argparse
@@ -130,11 +132,12 @@ def parse_args():
     parser.add_argument("--param_source", choices=["ema", "params"], default="ema")
     parser.add_argument(
         "--weight_mode",
-        choices=["vdm_xpred", "none"],
+        choices=["vdm_xpred", "clamped_vpred", "none"],
         default="vdm_xpred",
         help=(
-            "Latent bound weighting. vdm_xpred is the VDM x-prediction "
-            "weight t/(sigma^2*(1-t)^3) on clean-latent prediction error."
+            "Latent weighting. vdm_xpred is the singular VDM x-prediction "
+            "weight t/(sigma^2*(1-t)^3). clamped_vpred uses the ELF training "
+            "velocity clamp 1/max(1-t,t_eps)^2 as a finite latent proxy."
         ),
     )
     parser.add_argument(
@@ -149,6 +152,14 @@ def parse_args():
         help=(
             "Only used with --time_proposal truncated_uniform. Clips t samples to "
             "[t_min, 1 - t_min], which intentionally truncates endpoint mass."
+        ),
+    )
+    parser.add_argument(
+        "--t_max", type=float, default=1.0,
+        help=(
+            "Upper endpoint for the latent time integral. Values <1 intentionally "
+            "drop the clean-end latent singularity and should be reported as a "
+            "truncated latent proxy, not a strict clean-latent ELBO."
         ),
     )
     parser.add_argument(
@@ -241,12 +252,15 @@ def make_eval_dataset(path, num_examples, start_index, streaming=False, split="t
     return ds.select(range(start_index, end_index)), total, start_index, end_index, False
 
 
-def elbo_weight(t, mode, denoiser_noise_scale):
+def elbo_weight(t, mode, denoiser_noise_scale, t_eps):
     if mode == "none":
         return jnp.ones_like(t)
     if mode == "vdm_xpred":
         sigma2 = jnp.asarray(denoiser_noise_scale ** 2, dtype=t.dtype)
         return t / (sigma2 * (1.0 - t) ** 3)
+    if mode == "clamped_vpred":
+        denom = jnp.maximum(1.0 - t, jnp.asarray(t_eps, dtype=t.dtype))
+        return 1.0 / (denom ** 2)
     raise ValueError(f"Unknown weight_mode={mode}")
 
 
@@ -260,41 +274,48 @@ def sample_time_and_integral_weight(
     proposal_alpha,
     proposal_beta,
     t_min,
+    t_max,
 ):
-    """Sample t and return 1/q(t) for estimating ∫_0^1 f(t) dt."""
+    """Sample t and return importance weight for the configured time interval."""
+    t_upper = jnp.asarray(t_max, dtype=dtype)
     if proposal == "truncated_uniform":
+        t_lower = jnp.asarray(t_min, dtype=dtype)
+        t_upper = jnp.minimum(t_upper, jnp.asarray(1.0 - t_min, dtype=dtype))
+        width = t_upper - t_lower
         t = jax.random.uniform(
             rng,
             (batch_size,),
-            minval=jnp.asarray(t_min, dtype=dtype),
-            maxval=jnp.asarray(1.0 - t_min, dtype=dtype),
+            minval=t_lower,
+            maxval=t_upper,
             dtype=dtype,
         )
-        return t, jnp.full((batch_size,), 1.0 - 2.0 * t_min, dtype=dtype)
+        return t, jnp.full((batch_size,), width, dtype=dtype)
 
     if proposal == "sigmoid_normal":
         loc = jnp.asarray(proposal_loc, dtype=dtype)
         scale = jnp.asarray(proposal_scale, dtype=dtype)
         y = loc + jax.random.normal(rng, (batch_size,), dtype=dtype) * scale
-        t = jax.nn.sigmoid(y)
+        u = jax.nn.sigmoid(y)
+        t = t_upper * u
         log_q_y = -0.5 * ((y - loc) / scale) ** 2 - jnp.log(scale) - 0.5 * jnp.log(
             jnp.asarray(2.0 * jnp.pi, dtype=dtype)
         )
         log_q_t = log_q_y + jax.nn.softplus(-y) + jax.nn.softplus(y)
-        return t, jnp.exp(-log_q_t)
+        return t, t_upper * jnp.exp(-log_q_t)
 
     if proposal == "beta":
         alpha = jnp.asarray(proposal_alpha, dtype=dtype)
         beta = jnp.asarray(proposal_beta, dtype=dtype)
-        t = jax.random.beta(rng, alpha, beta, (batch_size,), dtype=dtype)
+        u = jax.random.beta(rng, alpha, beta, (batch_size,), dtype=dtype)
         eps = jnp.finfo(dtype).eps
-        t_safe = jnp.clip(t, eps, 1.0 - eps)
+        u_safe = jnp.clip(u, eps, 1.0 - eps)
+        t = t_upper * u_safe
         log_q_t = (
-            (alpha - 1.0) * jnp.log(t_safe)
-            + (beta - 1.0) * jnp.log1p(-t_safe)
+            (alpha - 1.0) * jnp.log(u_safe)
+            + (beta - 1.0) * jnp.log1p(-u_safe)
             - jsp_special.betaln(alpha, beta)
         )
-        return t_safe, jnp.exp(-log_q_t)
+        return t, t_upper * jnp.exp(-log_q_t)
 
     raise ValueError(f"Unknown time proposal: {proposal}")
 
@@ -320,6 +341,7 @@ def eval_token_elbo_step(
     time_proposal_scale,
     time_proposal_alpha,
     time_proposal_beta,
+    t_max,
 ):
     """Per-device token ELBO MC sample. Returns global psum'd sums."""
     rng = jax.random.fold_in(rng, jax.lax.axis_index(axis_name="batch"))
@@ -361,6 +383,7 @@ def eval_token_elbo_step(
         time_proposal_alpha,
         time_proposal_beta,
         t_min,
+        t_max,
     )
     noise = jax.random.normal(noise_rng, x0.shape, dtype=x0.dtype)
 
@@ -391,7 +414,7 @@ def eval_token_elbo_step(
     mse_per_dim_token = jnp.mean(sq_error, axis=-1)
     weight = (
         integral_weight
-        * elbo_weight(t, weight_mode, config.denoiser_noise_scale)
+        * elbo_weight(t, weight_mode, config.denoiser_noise_scale, config.t_eps)
     ).reshape(-1, 1)
     latent_nelbo_per_token = weight * sqnorm_per_token
     weighted_mse_per_dim_token = weight * mse_per_dim_token
@@ -723,6 +746,10 @@ def main():
         raise ValueError("--posterior_sigma must be > 0 for a true token ELBO")
     if not 0.0 <= args.t_min < 0.5:
         raise ValueError("--t_min must satisfy 0 <= t_min < 0.5")
+    if not 0.0 < args.t_max <= 1.0:
+        raise ValueError("--t_max must satisfy 0 < t_max <= 1")
+    if args.time_proposal == "truncated_uniform" and args.t_min >= min(args.t_max, 1.0 - args.t_min):
+        raise ValueError("--t_min must be below the truncated-uniform upper endpoint")
     if args.time_proposal_scale <= 0:
         raise ValueError("--time_proposal_scale must be > 0")
     if args.time_proposal_alpha <= 0 or args.time_proposal_beta <= 0:
@@ -891,6 +918,7 @@ def main():
             time_proposal_scale=args.time_proposal_scale,
             time_proposal_alpha=args.time_proposal_alpha,
             time_proposal_beta=args.time_proposal_beta,
+            t_max=args.t_max,
         ),
         axis_name="batch",
     )
@@ -984,11 +1012,14 @@ def main():
 
     elapsed = time.time() - start_time
     summary = summarize_repeats(repeat_rows, reference_mean=reference_mean)
+    strict_clean_latent = args.weight_mode == "vdm_xpred" and args.t_max == 1.0
     result = {
         "metric": "token_level_elbo_bias_variance",
         "primary_question": "Monte Carlo bias and variance of the ELF token-level ELBO estimator",
         "calibration_status": (
             "full_token_elbo_under_gaussian_variational_posterior_and_vdm_xpred_latent_bound"
+            if strict_clean_latent else
+            "truncated_or_clamped_latent_proxy_not_strict_clean_latent_elbo"
         ),
         "generative_model": "p(tokens,z)=p_flow(z)*p_decoder(tokens|z)",
         "variational_posterior": "q(z|tokens)=N(T5_encoder(tokens), posterior_sigma^2 I)",
@@ -1021,10 +1052,13 @@ def main():
         "time_proposal_alpha": args.time_proposal_alpha,
         "time_proposal_beta": args.time_proposal_beta,
         "t_min": args.t_min,
+        "t_max": args.t_max,
         "time_integral_note": (
-            "sigmoid_normal samples t from a full-support proposal on (0,1) "
-            "and weights by 1/q(t). truncated_uniform samples on "
-            "[t_min,1-t_min] and intentionally omits endpoint mass."
+            "sigmoid_normal and beta sample u from full-support proposals on (0,1), "
+            "then set t=t_max*u and weight by t_max/q(u). t_max < 1 intentionally "
+            "omits clean-end latent mass and is a truncated latent proxy, not a "
+            "strict clean-latent ELBO. truncated_uniform samples on "
+            "[t_min,min(t_max,1-t_min)]."
         ),
         "denoiser_noise_scale": config.denoiser_noise_scale,
         "elapsed_s": elapsed,

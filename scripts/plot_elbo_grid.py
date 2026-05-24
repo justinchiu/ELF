@@ -48,11 +48,17 @@ alt.data_transformers.disable_max_rows()
 def proposal_label(args):
     name = args["time_proposal"]
     if name == "sigmoid_normal":
-        return f"sigmoid_normal(loc={args['time_proposal_loc']:g}, scale={args['time_proposal_scale']:g})"
+        label = f"sigmoid_normal(loc={args['time_proposal_loc']:g}, scale={args['time_proposal_scale']:g})"
+        if args.get("t_max", 1.0) < 1.0:
+            label += f", t_max={args['t_max']:g}"
+        return label
     if name == "beta":
-        return f"Beta({args['time_proposal_alpha']:g}, {args['time_proposal_beta']:g})"
+        label = f"Beta({args['time_proposal_alpha']:g}, {args['time_proposal_beta']:g})"
+        if args.get("t_max", 1.0) < 1.0:
+            label += f", t_max={args['t_max']:g}"
+        return label
     if name == "truncated_uniform":
-        return f"trunc_uniform(t_min={args['t_min']:g})"
+        return f"trunc_uniform(t_min={args['t_min']:g}, t_max={args.get('t_max', 1.0):g})"
     return name
 
 
@@ -71,6 +77,8 @@ def load_summaries(input_root):
             "posterior_sigma_label": f"{blob['posterior_sigma']:g}",
             "mc_samples": blob["mc_samples"],
             "repeats": blob["repeats"],
+            "weight_mode": blob.get("weight_mode", "vdm_xpred"),
+            "t_max": blob.get("t_max", 1.0),
             "mean_nelbo": summary["mean_token_nelbo_per_token"],
             "std_nelbo": summary["std_token_nelbo_per_token"],
             "stderr_nelbo": summary["stderr_token_nelbo_per_token"],
@@ -428,6 +436,7 @@ def write_table(rows, out_path):
     """Tidy CSV of the per-run scalars for downstream analysis."""
     fields = [
         "run", "proposal", "proposal_kind", "posterior_sigma", "mc_samples", "repeats",
+        "weight_mode", "t_max",
         "mean_nelbo", "std_nelbo", "stderr_nelbo",
         "mean_iw", "std_iw", "max_iw", "max_over_mean_iw", "ess_frac",
         "mean_t", "max_t",
